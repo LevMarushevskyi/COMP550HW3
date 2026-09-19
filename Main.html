@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Assignment 3 — Crane Operator</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #0e1116; }
+  canvas { display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+
+<script>
+"use strict";
+
+var canvas = document.getElementById("scene");
+var ctx = canvas.getContext("2d");
+var STEP_MS = 1000 / 120;      
+var MAX_FRAME_MS = 250;        
+var LOG_STEPS = 40;            
+
+var CW = 38, CH = 26;          // crate size, and its collision box
+var BOOM_SPEED = 0.55;         // radians per second
+var LOWER_SPEED = 330;         // cable pay-out, pixels per second
+var RAISE_SPEED = 400;
+var TRAVEL_LEN = 55;           // cable length while the claw is stowed
+var GRAVITY = 1000;            // pixels per second squared
+var SLIDE = 155;               // sideways shove when a crate lands on something
+var TRUCK_SPEED = 95;
+var TRUCK_EXIT_SPEED = 280;
+var CRATES_PER_BATCH = 5;
+
+var A_RIGHT = 0;                       // boom straight out to the right
+var A_LEFT = -Math.PI;                
+
+/* I swear this isn't random since this assignment asks for a loop that behaves 
+    the same way every time. This produces the same stream of numbers from the same
+   seed, so an untouched run is reproducible to the last decimal. */
+
+var seed = 20260918;
+function rand() {
+  seed = (seed * 1103515245 + 12345) % 2147483648;
+  return seed / 2147483648;
+}
+
+
+var W = 0, H = 0;
+var L = {};
+var skyline = [];
+
+function layout() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+
+  L.groundY = H - 80;
+  L.craneX = Math.round(W * 0.54);
+
+  var mastH = Math.max(190, Math.min(380, H * 0.45));
+  L.topY = L.groundY - mastH;
+
+  L.boomLen = Math.max(200, Math.min(360, W * 0.32));
+  L.boomLen = Math.min(L.boomLen, L.topY - 40);
+
+  L.reach = L.boomLen * Math.cos(A_RIGHT);
+  L.yardMin = L.craneX + 70;                  // where crates may scatter
+  L.yardMax = L.craneX + L.reach;             // the mast is solid: an open lattice tower on a concrete pad
+  L.mastL = L.craneX - 19;
+  L.mastR = L.craneX + 19;
+  L.padL = L.craneX - 46;
+  L.padR = L.craneX + 46;
+  L.padY = L.groundY - 11;
+
+  L.patrolMin = 98;
+  L.patrolMax = Math.max(L.patrolMin + 60, L.padL - 78);
+
+  L.leverX = W - 90;                          
+  L.leverY = L.groundY + 16;
+  L.releaseY = L.groundY - 150;               
+  L.bedY = L.groundY - 58;                    
+  L.cabY = L.groundY - 100;                  
+  buildSkyline();
+}
+
+function buildSkyline() {
+  skyline = [];
+  var bodies = ["#1b2230", "#161d29", "#1e2635", "#1a212e"];
+  var x = -40;
+  while (x < W + 60) {
+    var w = 54 + Math.floor(rand() * 34);
+    var h = 110 + Math.floor(rand() * 180);
+    var rows = Math.floor((h - 16) / 20);
+    var cols = Math.floor((w - 12) / 17);
+    var lit = [];
+    for (var i = 0; i < rows * cols; i++) lit.push(rand() < 0.34);
+    skyline.push({
+      x: x, w: w, h: h, rows: rows, cols: cols, lit: lit,
+      body: bodies[Math.floor(rand() * bodies.length)],
+      glass: rand() < 0.5 ? "#f0c987" : "#e8bd76"
+    });
+    x += w + 16;
+  }
+}
+
+//MODEL
+var crane = {
+  angle: A_RIGHT, prevAngle: A_RIGHT,
+  dir: -1,                      
+  len: TRAVEL_LEN, prevLen: TRAVEL_LEN,
+  sway: 0, prevSway: 0,
+  spin: 0, prevSpin: 0,
+  jaw: 0, prevJaw: 0,         
+  mode: "stowed",               
+  held: null,
+  tipX: 0
+};
+
+var truck = {
+  x: 0, prevX: 0,
+  dir: 1,
+  wheel: 0, prevWheel: 0,
+  cargo: false,
+  state: "patrol"                
+};
+
+var crates = [];
+var score = 0;
+var leverPulled = false;         
+var lever = { angle: -0.5, prevAngle: -0.5, timer: 0 };
+var stepCount = 0;
+
+function spawnCrates() {
+  for (var i = 0; i < CRATES_PER_BATCH; i++) {
+    var x, tries = 0, ok;
+    do {
+      x = L.yardMin + rand() * (L.yardMax - L.yardMin);
+      ok = true;
+      for (var j = 0; j < crates.length; j++) {
+        if (Math.abs(crates[j].x - x) < CW + 12) { ok = false; break; }
+      }
+      tries++;
+    } while (!ok && tries < 30);
+
+    crates.push({
+      x: x, y: L.groundY, vx: 0, vy: 0,
+      state: "idle", prevX: x, prevY: L.groundY
+    });
+  }
+}
+
+function tipAt(angle) {
+  return {
+    x: L.craneX + L.boomLen * Math.cos(angle),
+    y: L.topY + L.boomLen * Math.sin(angle)
+  };
+}
+
+function savePrevious() {
+  crane.prevAngle = crane.angle;
+  crane.prevLen = crane.len;
+  crane.prevSway = crane.sway;
+  crane.prevSpin = crane.spin;
+  crane.prevJaw = crane.jaw;
+  truck.prevX = truck.x;
+  truck.prevWheel = truck.wheel;
+  lever.prevAngle = lever.angle;
+  for (var i = 0; i < crates.length; i++) {
+    crates[i].prevX = crates[i].x;
+    crates[i].prevY = crates[i].y;
+  }
+}
+
+function landOn(cr, surfaceY, leftEdge, rightEdge) {
+  cr.y = surfaceY;
+  cr.vy = 0;
+  var middle = (leftEdge + rightEdge) / 2;
+  cr.vx = (cr.x < middle ? -SLIDE : SLIDE);
+}
+
+
+function restingOn(cr, surfaceY, left, right) {
+  return cr.prevY <= surfaceY + 1 && cr.y > surfaceY &&
+         cr.x + CW / 2 > left && cr.x - CW / 2 < right;
+}
+
+/* Work out where the crates in the truck's path end up if it moves to
+   nextX. Crates are shoved along in front of the bumper, and a crate
+   already touching the one ahead passes the shove on to it. Each stack
+   level is worked out separately so a stack gets pushed as a column
+   rather than being spread out. */
+function pushChain(nextX, dir) {
+  var result = { moves: [], jam: false };
+  var rows = {};
+
+  for (var i = 0; i < crates.length; i++) {
+    var g = crates[i];
+    if (g.state !== "idle" || g.y <= L.cabY) continue;   
+    var level = Math.round((L.groundY - g.y) / CH);
+    if (!rows[level]) rows[level] = [];
+    rows[level].push(g);
+  }
+
+  for (var key in rows) {
+    var row = rows[key];
+
+    if (dir > 0) {                                  
+      row.sort(function (a, b) { return a.x - b.x; });
+      var edge = nextX + 78 + CW / 2;               
+      for (var r = 0; r < row.length; r++) {
+        var c = row[r];
+        if (c.x + CW / 2 <= nextX - 98) continue;   
+        if (c.x < edge) {
+          if (edge + CW / 2 > L.padL) { result.jam = true; return result; }
+          result.moves.push({ crate: c, x: edge });
+          edge += CW;
+        } else {
+          edge = c.x + CW;
+        }
+      }
+
+    } else {                                    
+      row.sort(function (a, b) { return b.x - a.x; });
+      var edgeL = nextX - 98 - CW / 2;
+      for (var s = 0; s < row.length; s++) {
+        var d = row[s];
+        if (d.x - CW / 2 >= nextX + 78) continue;   
+        if (d.x > edgeL) {
+          result.moves.push({ crate: d, x: edgeL });
+          edgeL -= CW;
+        } else {
+          edgeL = d.x - CW;
+        }
+      }
+    }
+  }
+  return result;
+}
+
+function update(dt) {
+
+  if (leverPulled) {
+    leverPulled = false;
+    lever.angle = 0.5;
+    lever.timer = 0.22;
+    if (crane.mode === "stowed") crane.mode = "lowering";
+  }
+  if (lever.timer > 0) {
+    lever.timer -= dt;
+    if (lever.timer <= 0) lever.angle = -0.5;
+  }
+
+  var prevTipX = crane.tipX;
+  if (crane.mode === "stowed") {
+    crane.angle += crane.dir * BOOM_SPEED * dt;
+    if (crane.angle <= A_LEFT) { crane.angle = A_LEFT; crane.dir = 1; }
+    if (crane.angle >= A_RIGHT) { crane.angle = A_RIGHT; crane.dir = -1; }
+  }
+
+  var tip = tipAt(crane.angle);
+  crane.tipX = tip.x;
+
+  var hookY = tip.y + crane.len;
+  var jawTip = hookY + 22;
+
+  if (crane.mode === "lowering") {
+    crane.len += LOWER_SPEED * dt;
+    hookY = tip.y + crane.len;
+    jawTip = hookY + 22;
+    crane.jaw = Math.min(1, crane.jaw + dt * 5);
+
+    if (crane.held) {
+      if (hookY + 18 + CH >= L.releaseY) {         
+        var h = crane.held;
+        h.state = "falling";
+        h.x = tip.x;
+        h.y = hookY + 18 + CH;
+        h.prevX = h.x;
+        h.prevY = h.y;
+        h.vx = 0;
+        h.vy = 0;
+        crane.held = null;
+        crane.mode = "rising";
+      }
+    } else {
+      for (var i = 0; i < crates.length; i++) {
+        var k = crates[i];
+        if (k.state !== "idle") continue;
+        if (Math.abs(k.x - tip.x) <= CW / 2 &&
+            jawTip >= k.y - CH && jawTip <= k.y) {
+          k.state = "held";
+          crane.held = k;
+          crane.mode = "rising";
+          break;
+        }
+      }
+      if (crane.mode === "lowering" && jawTip >= L.groundY + 2) crane.mode = "rising";
+    }
+
+  } else if (crane.mode === "rising") {
+    crane.len -= RAISE_SPEED * dt;
+    crane.jaw = Math.max(0, crane.jaw - dt * 5);
+    if (crane.len <= TRAVEL_LEN) {
+      crane.len = TRAVEL_LEN;
+      crane.mode = "stowed";
+    }
+  }
+
+  var bedL = truck.x - 52, bedR = truck.x + 78;
+  var catchL = truck.x - 46, catchR = truck.x + 72;
+  var cabL = truck.x - 98, cabR = truck.x - 52;
+
+  for (var n = crates.length - 1; n >= 0; n--) {
+    var cr = crates[n];
+    if (cr.state !== "falling") continue;
+
+    cr.vy += GRAVITY * dt;
+    cr.y += cr.vy * dt;
+    cr.x += cr.vx * dt;
+    cr.vx -= cr.vx * Math.min(1, dt * 1.2);
+
+  
+    var barL = (cr.y > L.padY) ? L.padL : L.mastL;
+    var barR = (cr.y > L.padY) ? L.padR : L.mastR;
+    if (cr.y > L.topY && cr.x + CW / 2 > barL && cr.x - CW / 2 < barR) {
+      var side = (cr.x < L.craneX) ? -1 : 1;
+      cr.x = (side < 0) ? barL - CW / 2 : barR + CW / 2;
+      cr.vx = side * SLIDE * 0.6;
+    }
+
+    for (var m = 0; m < crates.length; m++) {
+      var other = crates[m];
+      if (other === cr || other.state !== "idle") continue;
+
+      var top = other.y - CH;
+      var overlap = CW - Math.abs(cr.x - other.x);
+      if (overlap <= 0) continue;
+
+      if (overlap >= CW * 0.45) {
+        if (cr.prevY <= top + 1 && cr.y > top) {     // landed on it
+          cr.y = top;
+          cr.vy = 0;
+          cr.vx = 0;
+          cr.state = "idle";
+          break;
+        }
+      } else if (cr.y > top && cr.y - CH < other.y) { // corner clip
+        var away = (cr.x < other.x) ? -1 : 1;
+        cr.x += away * Math.min(overlap, 3);
+        cr.vx = away * 70;
+      }
+    }
+    if (cr.state !== "falling") continue;
+
+  
+    if (restingOn(cr, L.cabY, cabL, cabR)) landOn(cr, L.cabY, cabL, cabR);
+
+    if (restingOn(cr, L.bedY, bedL, bedR)) {
+      if (truck.state === "patrol" && !truck.cargo &&
+          cr.x > catchL && cr.x < catchR) {
+        crates.splice(n, 1);
+        score += 1;
+        truck.cargo = true;
+        truck.state = "leaving";
+        continue;
+      }
+      landOn(cr, L.bedY, bedL, bedR);
+    }
+
+    if (cr.y >= L.groundY) {         
+      cr.y = L.groundY;
+      cr.vy = 0;
+      cr.vx = 0;
+      cr.state = "idle";
+    }
+  }
+
+  if (crates.length === 0) spawnCrates();
+
+  /* 
+         While rolling around crates in the truck's path get shoved
+         along ahead of it. It only stops and turns around if a crate it
+         is pushing runs out of room against the crane, or if it reaches
+         the screen edge or the crane itself. Once a crate is in the bed
+         it stops colliding with anything so it can drive off cleanly,
+         and the empty one that replaces it stays that way until it has
+         finished pulling onto the screen (it shouldn't be possible to get anything out that far anyway?). */
+  var speed;
+  if (truck.state === "patrol") {
+    speed = TRUCK_SPEED * truck.dir;
+
+    var next = truck.x + speed * dt;
+    var chain = pushChain(next, truck.dir);
+
+    if (chain.jam) {
+      truck.dir = -truck.dir;               // if no more room = back the other way
+      speed = 0;
+    } else {
+      truck.x = next;
+      for (var mv = 0; mv < chain.moves.length; mv++) {
+        chain.moves[mv].crate.x = chain.moves[mv].x;
+      }
+    }
+
+    if (truck.x <= L.patrolMin) { truck.x = L.patrolMin; truck.dir = 1; }
+    if (truck.x >= L.patrolMax) { truck.x = L.patrolMax; truck.dir = -1; }
+
+  } else if (truck.state === "leaving") {
+    speed = -TRUCK_EXIT_SPEED;
+    truck.x += speed * dt;
+    if (truck.x < -220) {
+      truck.x = -220;
+      truck.prevX = -220;                
+      truck.cargo = false;
+      truck.state = "entering";
+    }
+  } else {
+    speed = TRUCK_EXIT_SPEED;
+    truck.x += speed * dt;
+    if (truck.x >= L.patrolMin) {
+      truck.x = L.patrolMin;
+      truck.dir = 1;
+      truck.state = "patrol";
+      for (var c2 = 0; c2 < crates.length; c2++) {
+        var p2 = crates[c2];
+        if (p2.state !== "idle" || p2.y <= L.cabY) continue;
+        if (p2.x + CW / 2 > truck.x - 98 && p2.x - CW / 2 < truck.x + 78) {
+          p2.x = truck.x + 78 + CW / 2;
+        }
+      }
+    }
+  }
+  truck.wheel += (speed / 15) * dt;
+
+  /* a crate shoved off the left edge is gone for good. No point
+    is scored */
+  for (var gone = crates.length - 1; gone >= 0; gone--) {
+    if (crates[gone].state !== "held" && crates[gone].x + CW / 2 <= 0) {
+      crates.splice(gone, 1);
+    }
+  }
+  for (var pass = 0; pass < 3; pass++) {
+    for (var a = 0; a < crates.length; a++) {
+      for (var b = a + 1; b < crates.length; b++) {
+        var p = crates[a], q = crates[b];
+        if (p.state !== "idle" || q.state !== "idle") continue;
+        if (Math.abs(p.y - q.y) > CH * 0.5) continue;  
+        var d = q.x - p.x;
+        var gap = Math.abs(d);
+        if (gap < CW) {
+          var push = (CW - gap) / 2;
+          var sign = d >= 0 ? 1 : -1;
+          p.x -= push * sign;
+          q.x += push * sign;
+        }
+      }
+    }
+  }
+  for (var e = 0; e < crates.length; e++) {
+    var cx = crates[e];
+    if (cx.state === "held") continue;
+    if (cx.state === "idle" &&
+        cx.x + CW / 2 > L.padL && cx.x - CW / 2 < L.padR) {
+      cx.x = (cx.x < L.craneX) ? L.padL - CW / 2 : L.padR + CW / 2;
+    }
+    cx.x = Math.min(W - CW / 2 - 2, cx.x);
+  }
+  if (truck.state === "patrol") {
+    for (var t = 0; t < crates.length; t++) {
+      var g = crates[t];
+      if (g.state !== "idle" || g.y <= L.cabY) continue;
+      if (g.x + CW / 2 > truck.x - 98 && g.x - CW / 2 < truck.x + 78) {
+        g.x = (truck.dir > 0) ? truck.x + 78 + CW / 2 : truck.x - 98 - CW / 2;
+        g.x = Math.min(W - CW / 2 - 2, g.x);
+      }
+    }
+  }
+
+  // More Crate collision physics stuff
+  var settling = true, guard = 0;
+  while (settling && guard++ < 6) {
+    settling = false;
+    for (var s2 = 0; s2 < crates.length; s2++) {
+      var u = crates[s2];
+      if (u.state !== "idle" || u.y >= L.groundY - 1) continue;
+      var supported = false;
+      for (var v = 0; v < crates.length; v++) {
+        var lower = crates[v];
+        if (lower === u || lower.state !== "idle") continue;
+        if (Math.abs(lower.y - CH - u.y) < 4 && Math.abs(lower.x - u.x) < CW * 0.6) {
+          supported = true;
+          break;
+        }
+      }
+      if (!supported) {
+        u.state = "falling";
+        u.vx = 0;
+        u.vy = 0;
+        settling = true;
+      }
+    }
+  }
+
+  // box swining on moving boom physics
+  var tipSpeed = (crane.tipX - prevTipX) / dt;
+  var swayTarget = Math.max(-0.22, Math.min(0.22, tipSpeed * 0.0016));
+  crane.sway += (swayTarget - crane.sway) * Math.min(1, dt * 4);
+  crane.spin += (crane.len - crane.prevLen) * 0.12 + dt * 0.5;
+
+  if (stepCount < LOG_STEPS) console.log("boom.angle = " + crane.angle);
+  stepCount++;
+}
+
+// CONTROLLER
+
+function pullLever() { leverPulled = true; }
+
+function overLever(x, y) {
+  return x > L.leverX - 46 && x < L.leverX + 46 &&
+         y > L.leverY - 74 && y < L.leverY + 24;
+}
+
+canvas.addEventListener("mousedown", function (e) {
+  if (overLever(e.clientX, e.clientY)) pullLever();
+});
+
+canvas.addEventListener("touchstart", function (e) {
+  var t = e.changedTouches[0];
+  if (overLever(t.clientX, t.clientY)) { pullLever(); e.preventDefault(); }
+}, { passive: false });
+
+window.addEventListener("keydown", function (e) {
+  if (e.code === "Space" || e.key === " ") { pullLever(); e.preventDefault(); }
+});
+
+// VIEW
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function drawSky() {
+  var g = ctx.createLinearGradient(0, 0, 0, L.groundY);
+  g.addColorStop(0, "#101828");
+  g.addColorStop(0.55, "#1d2b3f");
+  g.addColorStop(1, "#3b3a4a");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, L.groundY);
+
+  ctx.globalAlpha = 0.3;
+  ctx.fillStyle = "#e0a05a";
+  ctx.beginPath();
+  ctx.arc(W * 0.8, L.groundY - 130, 50, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+function drawSkyline() {
+  for (var i = 0; i < skyline.length; i++) {
+    var b = skyline[i];
+    var y = L.groundY - b.h;
+    ctx.fillStyle = b.body;
+    ctx.fillRect(b.x, y, b.w, b.h);
+    ctx.fillStyle = "rgba(255,255,255,0.05)";
+    ctx.fillRect(b.x, y, 8, b.h);
+    for (var r = 0; r < b.rows; r++) {
+      for (var c = 0; c < b.cols; c++) {
+        ctx.fillStyle = b.lit[r * b.cols + c] ? b.glass : "rgba(0,0,0,0.30)";
+        ctx.fillRect(b.x + 10 + c * 17, y + 14 + r * 20, 9, 11);
+      }
+    }
+  }
+}
+
+function drawGround() {
+  ctx.fillStyle = "#2b2721";
+  ctx.fillRect(0, L.groundY, W, H - L.groundY);
+  ctx.fillStyle = "#3a352c";
+  ctx.fillRect(0, L.groundY, W, 5);
+}
+
+function drawCrate(cx, bottomY) {
+  var x = cx - CW / 2, y = bottomY - CH;
+  ctx.fillStyle = "#a9763c";
+  ctx.fillRect(x, y, CW, CH);
+  ctx.strokeStyle = "#6d4a22";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x + 1, y + 1, CW - 2, CH - 2);
+  ctx.beginPath();
+  ctx.moveTo(x + 3, y + 3); ctx.lineTo(x + CW - 3, y + CH - 3);
+  ctx.moveTo(x + CW - 3, y + 3); ctx.lineTo(x + 3, y + CH - 3);
+  ctx.stroke();
+}
+
+function drawTruck(a) {
+  var x = lerp(truck.prevX, truck.x, a);
+  var wheel = lerp(truck.prevWheel, truck.wheel, a);
+
+  ctx.save();
+  ctx.translate(x, L.groundY);
+
+  ctx.fillStyle = "#31506b";                      
+  ctx.fillRect(-52, -58, 130, 14);
+  ctx.fillStyle = "#24405a";
+  ctx.fillRect(-52, -74, 6, 16);                   
+  ctx.fillRect(72, -74, 6, 16);
+
+  ctx.fillStyle = "#3b6187";                       
+  ctx.fillRect(-98, -100, 46, 56);
+  ctx.fillStyle = "#7fd3e8";
+  ctx.fillRect(-86, -94, 28, 22);
+  ctx.fillStyle = "#24405a";
+  ctx.fillRect(-98, -46, 46, 6);
+
+  if (truck.cargo) drawCrate(16, -58);
+
+  var wheels = [-34, 52];
+  for (var i = 0; i < wheels.length; i++) {
+    ctx.save();
+    ctx.translate(wheels[i], -15);
+    ctx.rotate(wheel);
+    ctx.fillStyle = "#23262c";
+    ctx.beginPath();
+    ctx.arc(0, 0, 15, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "#8b9099";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(-11, 0); ctx.lineTo(11, 0);
+    ctx.moveTo(0, -11); ctx.lineTo(0, 11);
+    ctx.stroke();
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+function drawTruss(len, depth, step) {
+  var h = depth / 2;
+  ctx.strokeStyle = "#d8a01f";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(0, -h); ctx.lineTo(len, -h);
+  ctx.moveTo(0, h);  ctx.lineTo(len, h);
+  ctx.stroke();
+
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  var up = true;
+  for (var x = 0; x < len; x += step) {
+    var x2 = Math.min(x + step, len);
+    ctx.moveTo(x, up ? h : -h);
+    ctx.lineTo(x2, up ? -h : h);
+    up = !up;
+  }
+  ctx.stroke();
+}
+
+function drawWheel(r, angle) {
+  ctx.save();
+  ctx.rotate(angle);
+  ctx.fillStyle = "#3b3f47";
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#cfd4dc";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.beginPath();
+  for (var i = 0; i < 3; i++) {
+    var a = i * Math.PI / 3;
+    ctx.moveTo(-Math.cos(a) * r, -Math.sin(a) * r);
+    ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawMast() {
+  ctx.save();
+  ctx.translate(L.craneX, L.groundY);
+
+  ctx.fillStyle = "#4d4740";
+  ctx.fillRect(-46, -11, 92, 11);
+
+  var mastH = L.groundY - L.topY;
+  ctx.strokeStyle = "#d8a01f";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(-15, 0); ctx.lineTo(-15, -mastH);
+  ctx.moveTo(15, 0);  ctx.lineTo(15, -mastH);
+  ctx.stroke();
+
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (var y = 0; y > -mastH; y -= 32) {
+    var y2 = Math.max(y - 32, -mastH);
+    ctx.moveTo(-15, y); ctx.lineTo(15, y);
+    ctx.moveTo(-15, y); ctx.lineTo(15, y2);
+    ctx.moveTo(15, y);  ctx.lineTo(-15, y2);
+  }
+  ctx.moveTo(-15, -mastH); ctx.lineTo(15, -mastH);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.fillStyle = "#c8971c";
+  ctx.fillRect(L.craneX + 15, L.topY + 22, 30, 27);
+  ctx.fillStyle = "#7fd3e8";
+  ctx.fillRect(L.craneX + 20, L.topY + 27, 20, 13);
+}
+
+function drawBoom(a) {
+  var angle = lerp(crane.prevAngle, crane.angle, a);
+  var len = lerp(crane.prevLen, crane.len, a);
+  var sway = lerp(crane.prevSway, crane.sway, a);
+  var spin = lerp(crane.prevSpin, crane.spin, a);
+  var jaw = lerp(crane.prevJaw, crane.jaw, a);
+
+  ctx.save();
+  ctx.translate(L.craneX, L.topY);
+
+  ctx.fillStyle = "#8a6a12";
+  ctx.beginPath();
+  ctx.arc(0, 0, 13, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.rotate(angle);                      
+  drawTruss(L.boomLen, 18, 28);
+
+  ctx.save();
+  ctx.translate(L.boomLen, 0);
+  ctx.fillStyle = "#7d7f86";
+  ctx.fillRect(-8, -11, 16, 22);
+  ctx.save(); ctx.translate(0, -5); drawWheel(5, spin);  ctx.restore();
+  ctx.save(); ctx.translate(0, 5);  drawWheel(5, -spin); ctx.restore();
+
+  
+  ctx.rotate(-angle);
+  ctx.rotate(sway);
+
+  ctx.strokeStyle = "#cbd0d8";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(0, len);
+  ctx.stroke();
+
+  ctx.translate(0, len);
+
+  ctx.fillStyle = "#5a5f68";
+  ctx.fillRect(-13, 0, 26, 14);
+  ctx.strokeStyle = "#2a2d33";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(-13, 0, 26, 14);
+
+  ctx.strokeStyle = "#9aa0a8";
+  ctx.lineWidth = 4;
+  for (var s = -1; s <= 1; s += 2) {
+    ctx.save();
+    ctx.translate(s * 8, 13);
+    ctx.rotate(s * jaw * 0.85);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(0, 7);
+    ctx.lineTo(s * 7, 12);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  if (crane.held) drawCrate(0, 18 + CH);
+
+  ctx.restore();  
+  ctx.restore();   
+}
+
+function drawLever(a) {
+  var ang = lerp(lever.prevAngle, lever.angle, a);
+
+  ctx.save();
+  ctx.translate(L.leverX, L.leverY);
+
+  ctx.fillStyle = "#3f4650";
+  ctx.fillRect(-34, -14, 68, 22);
+  ctx.fillStyle = "#2b3038";
+  ctx.fillRect(-34, -14, 68, 5);
+
+  ctx.save();
+  ctx.rotate(ang);
+  ctx.strokeStyle = "#b9bfc8";
+  ctx.lineWidth = 7;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(0, -50);
+  ctx.stroke();
+  ctx.fillStyle = "#d9534f";
+  ctx.beginPath();
+  ctx.arc(0, -54, 9, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.fillStyle = "rgba(255,255,255,0.55)";
+  ctx.font = "13px Georgia, serif";
+  ctx.textAlign = "center";
+  ctx.fillText("LEVER", 0, 24);
+  ctx.textAlign = "left";
+  ctx.restore();
+}
+
+function drawHUD() {
+  ctx.fillStyle = "#e8ebef";
+  ctx.font = "28px Georgia, serif";
+  ctx.fillText("Score: " + score, 24, 46);
+}
+
+function render(a) {
+  ctx.clearRect(0, 0, W, H);
+  drawSky();
+  drawSkyline();
+  drawGround();
+
+  for (var i = 0; i < crates.length; i++) {
+    var c = crates[i];
+    if (c.state === "held") continue;     
+    drawCrate(lerp(c.prevX, c.x, a), lerp(c.prevY, c.y, a));
+  }
+
+  drawTruck(a);
+  drawMast();
+  drawBoom(a);
+  drawLever(a);
+  drawHUD();
+}
+
+// Main loop
+
+var accumulator = 0;
+var lastTime = 0;
+var frameCount = 0;
+
+function mainLoop(now) {
+  requestAnimationFrame(mainLoop);
+
+  var frameTime = now - lastTime;
+  lastTime = now;
+  if (frameTime > MAX_FRAME_MS) frameTime = MAX_FRAME_MS;
+
+  accumulator += frameTime;
+
+  while (accumulator >= STEP_MS) {
+    savePrevious();
+    update(STEP_MS / 1000);       // always the same dt NOT RANDOM
+    accumulator -= STEP_MS;
+  }
+
+  render(accumulator / STEP_MS);
+
+  if (frameCount < LOG_STEPS) console.log("frame: " + frameCount);
+  frameCount++;
+}
+
+window.addEventListener("resize", function () {
+  layout();
+  truck.x = Math.max(L.patrolMin, Math.min(L.patrolMax, truck.x));
+  truck.prevX = truck.x;
+});
+
+layout();
+truck.x = L.patrolMax;
+truck.prevX = truck.x;
+spawnCrates();
+crane.tipX = tipAt(crane.angle).x;
+requestAnimationFrame(function (t) { lastTime = t; mainLoop(t); });
+</script>
+</body>
+</html>
